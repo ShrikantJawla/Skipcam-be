@@ -11,6 +11,7 @@ const CLIENT_ORIGINS = (
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+  
 function isAllowedOrigin(origin: string | undefined): boolean {
   // Non-browser clients / same-host probes may omit Origin
   if (!origin) return true;
