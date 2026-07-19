@@ -3,20 +3,65 @@ import http from "http";
 import { Server, Socket } from "socket.io";
 import cors from "cors";
 
+const CLIENT_ORIGINS = (
+  process.env.CLIENT_ORIGINS ||
+  "http://localhost:3000,https://skipcam-fe.vercel.app"
+)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+function isAllowedOrigin(origin: string | undefined): boolean {
+  // Non-browser clients / same-host probes may omit Origin
+  if (!origin) return true;
+  if (CLIENT_ORIGINS.includes(origin)) return true;
+  // Vercel preview deployments
+  if (/^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) return true;
+  return false;
+}
+
+const corsOptions: cors.CorsOptions = {
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
+  methods: ["GET", "POST"],
+  credentials: true,
+};
+
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
+
+// Queue of socket IDs waiting to be matched
+let waitingQueue: string[] = [];
+
+// Maps each socket.id to their partner's socket.id
+const pairs: Record<string, string> = {};
+
+app.get("/", (_req, res) => {
+  res.type("text").send("Skipcam signaling server is running");
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    waiting: waitingQueue.length,
+    pairs: Object.keys(pairs).length / 2,
+  });
+});
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: "http://localhost:3000",
-    methods: ["GET", "POST"],
-  },
+  cors: corsOptions,
+  transports: ["websocket", "polling"],
+  allowEIO3: true,
 });
 
 // Signaling payloads are opaque to the server (relayed as-is).
-// Defined locally so we don't need DOM lib types in a Node project.
 type SessionDescriptionInit = {
   type?: "offer" | "answer" | "pranswer" | "rollback";
   sdp?: string;
@@ -29,13 +74,6 @@ type IceCandidateInit = {
   usernameFragment?: string | null;
 };
 
-// Queue of socket IDs waiting to be matched
-let waitingQueue: string[] = [];
-
-// Maps each socket.id to their partner's socket.id
-const pairs: Record<string, string> = {};
-
-// Helper: break a pair and notify the partner
 function disconnectFromPartner(socket: Socket): void {
   const partnerId = pairs[socket.id];
   if (partnerId) {
@@ -51,41 +89,37 @@ function disconnectFromPartner(socket: Socket): void {
 io.on("connection", (socket: Socket) => {
   console.log("User connected:", socket.id);
 
-  // --- MATCHMAKING ---
   socket.on("find-match", () => {
-    // Remove from queue if already in it (safety check)
+    // Leave any existing pair before re-queueing
+    disconnectFromPartner(socket);
     waitingQueue = waitingQueue.filter((id) => id !== socket.id);
+
+    // Drop stale IDs that are no longer connected
+    waitingQueue = waitingQueue.filter((id) => io.sockets.sockets.has(id));
 
     if (waitingQueue.length > 0) {
       const partnerId = waitingQueue.shift()!;
       const partner = io.sockets.sockets.get(partnerId);
 
       if (!partner) {
-        // That waiting user disconnected, add current user to queue
         waitingQueue.push(socket.id);
         socket.emit("waiting");
         return;
       }
 
-      // Record the pairing both ways
       pairs[socket.id] = partnerId;
       pairs[partnerId] = socket.id;
 
-      // The waiting user (partner) creates the WebRTC offer
       partner.emit("matched", { initiator: true });
       socket.emit("matched", { initiator: false });
 
       console.log(`Paired: ${partnerId} <-> ${socket.id}`);
     } else {
-      // No one waiting — join the queue
       waitingQueue.push(socket.id);
       socket.emit("waiting");
-      console.log("Waiting:", socket.id);
+      console.log("Waiting:", socket.id, "| queue:", waitingQueue.length);
     }
   });
-
-  // --- WEBRTC SIGNALING ---
-  // Just relay messages between paired users — server doesn't interpret these
 
   socket.on("offer", (data: SessionDescriptionInit) => {
     const partnerId = pairs[socket.id];
@@ -108,7 +142,6 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  // --- TEXT CHAT ---
   socket.on("chat-message", (text: unknown) => {
     if (typeof text !== "string") return;
     const trimmed = text.trim().slice(0, 500);
@@ -120,7 +153,6 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  // --- REACTIONS ---
   const ALLOWED_REACTIONS = new Set(["👋", "🔥", "😂", "👏", "❤️"]);
   socket.on("reaction", (emoji: unknown) => {
     if (typeof emoji !== "string" || !ALLOWED_REACTIONS.has(emoji)) return;
@@ -131,7 +163,6 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  // --- REPORT ---
   socket.on("report", (payload: { reason?: string }) => {
     const partnerId = pairs[socket.id];
     console.log("Report:", {
@@ -142,16 +173,13 @@ io.on("connection", (socket: Socket) => {
     socket.emit("report-received");
   });
 
-  // --- NEXT / SKIP ---
   socket.on("next", () => {
     disconnectFromPartner(socket);
-    // Re-queue this user (dedupe in case they were already waiting)
     waitingQueue = waitingQueue.filter((id) => id !== socket.id);
     waitingQueue.push(socket.id);
     socket.emit("waiting");
   });
 
-  // --- DISCONNECT ---
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
     waitingQueue = waitingQueue.filter((id) => id !== socket.id);
@@ -159,7 +187,8 @@ io.on("connection", (socket: Socket) => {
   });
 });
 
-const PORT = 5000;
-server.listen(PORT, () => {
-  console.log(`Signaling server running on http://localhost:${PORT}`);
+const PORT = Number(process.env.PORT) || 5000;
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Signaling server running on port ${PORT}`);
+  console.log(`Allowed origins: ${CLIENT_ORIGINS.join(", ")} (+ *.vercel.app)`);
 });
