@@ -17,6 +17,16 @@ function isAllowedOrigin(origin: string | undefined): boolean {
   if (CLIENT_ORIGINS.includes(origin)) return true;
   // Vercel preview deployments
   if (/^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) return true;
+  // Local tunneling for device testing (localtunnel / ngrok / Cloudflare)
+  if (/^https:\/\/[a-z0-9-]+\.loca\.lt$/i.test(origin)) return true;
+  if (/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(origin)) return true;
+  if (
+    /^https:\/\/[a-z0-9-]+\.(ngrok-free\.app|ngrok-free\.dev|ngrok\.app)$/i.test(
+      origin,
+    )
+  ) {
+    return true;
+  }
   return false;
 }
 
